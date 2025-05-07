@@ -9,13 +9,15 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import threading
 import json
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
+import time
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
-app = Flask(_name_)
+app = Flask(__name__)
 app.config.from_object(Config)
 
 db.init_app(app)
@@ -35,17 +37,16 @@ def uri_to_dsn(uri):
     port = parsed.port
     return f"dbname={dbname} user={user} password={password} host={host} port={port}"
 
-# Function to listen for PostgreSQL notifications
+# Function to listen for PostgreSQL notifications with retry
+@retry(stop=stop_after_attempt(5), wait=wait_fixed(10))
 def listen_for_notifications():
     try:
-        # Convert the SQLAlchemy URI to a DSN string for psycopg2
         dsn = uri_to_dsn(app.config['SQLALCHEMY_DATABASE_URI'])
         conn = psycopg2.connect(dsn)
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
         
-        # Listen to all relevant channels
-        channels = ['new_microcontrolleur', 'new_data', 'device_state_channel', 'diagnostic_result_channel', 'new_alert']
+        channels = ['new_microcontrolleur', 'new_data', 'new_alert', 'new_presence']
         for channel in channels:
             cursor.execute(f"LISTEN {channel};")
         
@@ -60,7 +61,6 @@ def listen_for_notifications():
                 if notify.channel == 'new_microcontrolleur':
                     socketio.emit('new_microcontrolleur', {'type': 'new_microcontrolleur', 'data': payload})
                 elif notify.channel == 'new_data':
-                    # Fetch additional data for the sensor reading
                     cursor.execute("""
                         SELECT d.id, d.capteurid, d.valeur, d.timestamp,
                                c.etat, t.nom AS type, t.unite, m.nom AS microcontrolleur
@@ -78,43 +78,12 @@ def listen_for_notifications():
                             'etat': result[4],
                             'valeur': result[2],
                             'unite': result[6],
-                            'calibrated': True,  # Placeholder
+                            'calibrated': True,
                             'timestamp': result[3].isoformat() + 'Z',
                             'microcontrolleur': result[7]
                         }
                         socketio.emit('new_data', {'type': 'new_data', 'data': sensor_data})
                         logger.info(f"Emitted new_data: {sensor_data}")
-                elif notify.channel == 'device_state_channel':
-                    socketio.emit('device_state_update', {
-                        'type': 'device_state_update',
-                        'data': {
-                            'id': payload['id'],
-                            'microcontrolleurid': payload['microcontrolleurid'],
-                            'cpu': payload['cpu'],
-                            'ram': payload['ram'],
-                            'ramTotal': payload['ram_total'],
-                            'temperature': payload['temperature'],
-                            'storage': payload['storage'],
-                            'storageTotal': payload['storage_total'],
-                            'uptime': payload['uptime'],
-                            'processes': payload['processes'],
-                            'timestamp': payload['timestamp']
-                        }
-                    })
-                    logger.info(f"Emitted device_state_update: {payload}")
-                elif notify.channel == 'diagnostic_result_channel':
-                    socketio.emit('diagnostic_result', {
-                        'type': 'diagnostic_result',
-                        'data': {
-                            'id': payload['id'],
-                            'microcontrolleurid': payload['microcontrolleurid'],
-                            'capteurid': payload['capteurid'],
-                            'result': payload['result'],
-                            'severity': payload['severity'],
-                            'timestamp': payload['timestamp']
-                        }
-                    })
-                    logger.info(f"Emitted diagnostic_result: {payload}")
                 elif notify.channel == 'new_alert':
                     message = f"{payload['type']}: {payload['statut'].capitalize()}"
                     if payload['capteurid']:
@@ -126,19 +95,34 @@ def listen_for_notifications():
                             'type': payload['type'],
                             'dateheure': payload['dateheure'],
                             'statut': payload['statut'],
+                            'etudiantid': payload['etudiantid'],
+                            'capteurid': payload['capteurid'],
+                            'enseignantid': payload['enseignantid'],
+                            'technicienid': payload['technicienid'],
                             'message': message
                         }
                     })
                     logger.info(f"Emitted new_alert: {payload}")
+                elif notify.channel == 'new_presence':
+                    socketio.emit('new_presence', {
+                        'type': 'new_presence',
+                        'data': {
+                            'id': payload['id'],
+                            'etudiantid': payload['etudiantid'],
+                            'statut': payload['statut'],
+                            'date_heure': payload['date_heure']
+                        }
+                    })
+                    logger.info(f"Emitted new_presence: {payload}")
     except Exception as e:
         logger.error(f"Error in notification listener: {str(e)}")
+        raise
 
 # Start the notification listener in a separate thread
 thread = threading.Thread(target=listen_for_notifications, daemon=True)
 thread.start()
 
-if _name_ == '_main_':
+if __name__ == '__main__':
     with app.app_context():
-        db.create_all()  # Create tables if they don't exist
-    logger.info("Starting Flask-SocketIO server...")
-    socketio.run(app, host='0.0.0.0', port=8083, debug=True)
+        logger.info("Starting Flask-SocketIO server...")
+        socketio.run(app, host='0.0.0.0', port=8083, debug=True)

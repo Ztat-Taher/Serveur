@@ -1,7 +1,7 @@
 # routes/microcontrolleur.py
 from flask import Blueprint, jsonify, request
 from datetime import datetime
-from ..models.db import db, Microcontrolleur, TypeCapteur, Capteur, DonneeCapteur, DeviceState, DiagnosticResult, Alerte
+from ..models.db import db, Microcontrolleur, TypeCapteur, Capteur, DonneeCapteur, Alerte
 import json
 
 microcontrolleur_bp = Blueprint('microcontrolleur', __name__, url_prefix='/api')
@@ -19,24 +19,66 @@ def register_microcontroller():
     if not data or 'nom' not in data or 'identifier' not in data:
         return jsonify({'error': 'Missing nom or identifier'}), 400
 
-    # Check if microcontroller exists by identifier (e.g., hostname or MAC address)
+    # Check if microcontroller exists by identifier
     existing = Microcontrolleur.query.filter_by(nom=data['identifier']).first()
     if existing:
-        return jsonify({'message': 'Microcontroller already registered', 'id': existing.id}), 200
+        # Return existing microcontroller ID and associated sensor IDs
+        sensors = Capteur.query.filter_by(microcontrolleurid=existing.id).all()
+        return jsonify({
+            'message': 'Microcontroller already registered',
+            'id': existing.id,
+            'sensors': {s.etat: s.id for s in sensors}
+        }), 200
 
-    # Create new microcontroller
     try:
+        # Create microcontroller
         microcontroller = Microcontrolleur(nom=data['nom'])
         db.session.add(microcontroller)
+        db.session.flush()  # Get microcontroller.id
+
+        # Create sensor types if they don't exist
+        sensor_types = {
+            'cpu': {'nom': 'CPU Usage', 'unite': '%'},
+            'ram': {'nom': 'RAM Usage', 'unite': 'MB'},
+            'temperature': {'nom': 'Temperature', 'unite': 'C'},
+            'storage': {'nom': 'Storage Usage', 'unite': 'GB'},
+            'uptime': {'nom': 'Uptime', 'unite': 'seconds'},
+            'processes': {'nom': 'Processes', 'unite': 'count'}
+        }
+        sensor_type_ids = {}
+        for key, info in sensor_types.items():
+            sensor_type = TypeCapteur.query.filter_by(nom=info['nom']).first()
+            if not sensor_type:
+                sensor_type = TypeCapteur(nom=info['nom'], unite=info['unite'])
+                db.session.add(sensor_type)
+                db.session.flush()
+            sensor_type_ids[key] = sensor_type.id
+
+        # Create sensors for each metric
+        sensors = {}
+        for key, type_id in sensor_type_ids.items():
+            sensor = Capteur(
+                typecapteurid=type_id,
+                etat=key,  # e.g., 'cpu', 'ram'
+                microcontrolleurid=microcontroller.id
+            )
+            db.session.add(sensor)
+            db.session.flush()
+            sensors[key] = sensor.id
+
         db.session.commit()
 
-        # Trigger PostgreSQL notification
+        # Trigger notification
         db.session.execute("NOTIFY new_microcontrolleur, %s", (json.dumps({
             'id': microcontroller.id,
             'nom': microcontroller.nom
         }),))
 
-        return jsonify({'message': 'Microcontroller registered', 'id': microcontroller.id}), 201
+        return jsonify({
+            'message': 'Microcontroller registered',
+            'id': microcontroller.id,
+            'sensors': sensors
+        }), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
@@ -62,77 +104,38 @@ def get_sensor_data():
         } for data in sensor_data]
     })
 
-@microcontrolleur_bp.route('/device-states', methods=['GET'])
-def get_device_states():
-    device_states = DeviceState.query.order_by(DeviceState.timestamp.desc()).all()
-    return jsonify({
-        'deviceStates': [{
-            'id': state.id,
-            'microcontrolleurid': state.microcontrolleurid,
-            'cpu': state.cpu,
-            'ram': state.ram,
-            'ramTotal': state.ram_total,
-            'temperature': state.temperature,
-            'storage': state.storage,
-            'storageTotal': state.storage_total,
-            'uptime': state.uptime,
-            'processes | processes': state.processes,
-            'timestamp': state.timestamp.isoformat() + 'Z'
-        } for state in device_states]
-    })
-
-@microcontrolleur_bp.route('/device-states', methods=['POST'])
-def add_device_state():
+@microcontrolleur_bp.route('/device-metrics', methods=['POST'])
+def add_device_metrics():
     data = request.get_json()
+    if not data or 'microcontrolleurid' not in data or 'metrics' not in data:
+        return jsonify({'error': 'Missing microcontrolleurid or metrics'}), 400
+
     try:
-        device_state = DeviceState(
-            microcontrolleurid=data['microcontrolleurid'],
-            cpu=data.get('cpu'),
-            ram=data.get('ram'),
-            ram_total=data.get('ram_total'),
-            temperature=data.get('temperature'),
-            storage=data.get('storage'),
-            storage_total=data.get('storage_total'),
-            uptime=data.get('uptime'),
-            processes=data.get('processes'),
-            timestamp=datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00'))
-        )
-        db.session.add(device_state)
+        timestamp = datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00'))
+        for metric_name, value in data['metrics'].items():
+            # Find the sensor for this metric
+            sensor = Capteur.query.filter_by(
+                microcontrolleurid=data['microcontrolleurid'],
+                etat=metric_name
+            ).first()
+            if not sensor:
+                return jsonify({'error': f'No sensor found for metric {metric_name}'}), 400
+
+            # Add metric to donneescapteurs
+            donnee = DonneeCapteur(
+                capteurid=sensor.id,
+                valeur=float(value),
+                timestamp=timestamp
+            )
+            db.session.add(donnee)
+
         db.session.commit()
 
-        # Trigger PostgreSQL notification
-        db.session.execute("NOTIFY device_state_channel, %s", (json.dumps({
-            'id': device_state.id,
-            'microcontrolleurid': device_state.microcontrolleurid,
-            'cpu': device_state.cpu,
-            'ram': device_state.ram,
-            'ram_total': device_state.ram_total,
-            'temperature': device_state.temperature,
-            'storage': device_state.storage,
-            'storage_total': device_state.storage_total,
-            'uptime': device_state.uptime,
-            'processes': device_state.processes,
-            'timestamp': device_state.timestamp.isoformat() + 'Z'
-        }),))
-
-        return jsonify({'message': 'Device state added'}), 201
+        # Trigger notification for each donneescapteur (handled by trigger)
+        return jsonify({'message': 'Device metrics added'}), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 400
-
-@microcontrolleur_bp.route('/diagnostic-results', methods=['GET'])
-def get_diagnostic_results():
-    diagnostic_results = DiagnosticResult.query.order_by(DiagnosticResult.timestamp.desc()).all()
-    return jsonify({
-        'results': [{
-            'id': result.id,
-            'microcontrolleurid': result.microcontrolleurid,
-            'capteurid': result.capteurid,
-            'result': result.result,
-            'severity': result.severity,
-            'timestamp': result.timestamp.isoformat() + 'Z'
-        } for result in diagnostic_results]
-    })
 
 @microcontrolleur_bp.route('/alerts', methods=['GET'])
 def get_alerts():
@@ -143,6 +146,10 @@ def get_alerts():
             'type': alert.type,
             'dateheure': alert.dateheure.isoformat() + 'Z',
             'statut': alert.statut,
+            'etudiantid': alert.etudiantid,
+            'capteurid': alert.capteurid,
+            'enseignantid': alert.enseignantid,
+            'technicienid': alert.technicienid,
             'message': f"{alert.type}: {alert.statut.capitalize()}" + (f" (Sensor ID: {alert.capteurid})" if alert.capteurid else "")
         } for alert in alerts]
     })
