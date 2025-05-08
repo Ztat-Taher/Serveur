@@ -1,7 +1,7 @@
-# routes/microcontrolleur.py
 from flask import Blueprint, jsonify, request
 from datetime import datetime
 from ..models.db import db, Microcontrolleur, TypeCapteur, Capteur, DonneeCapteur, Alerte
+from sqlalchemy.sql import text
 import json
 
 microcontrolleur_bp = Blueprint('microcontrolleur', __name__, url_prefix='/api')
@@ -43,7 +43,22 @@ def register_microcontroller():
             'temperature': {'nom': 'Temperature', 'unite': 'C'},
             'storage': {'nom': 'Storage Usage', 'unite': 'GB'},
             'uptime': {'nom': 'Uptime', 'unite': 'seconds'},
-            'processes': {'nom': 'Processes', 'unite': 'count'}
+            'processes': {'nom': 'Processes', 'unite': 'count'},
+            'dht_temp': {'nom': 'DHT11 Temperature', 'unite': 'C'},
+            'humidity': {'nom': 'Humidity', 'unite': '%'},
+            'bmp_temp': {'nom': 'BMP280 Temperature', 'unite': 'C'},
+            'pressure': {'nom': 'Pressure', 'unite': 'hPa'},
+            'vibration': {'nom': 'Vibration', 'unite': 'binary'},
+            'voltage': {'nom': 'Voltage', 'unite': 'V'},
+            'current': {'nom': 'Current', 'unite': 'A'},
+            'cpu_usage': {'nom': 'CPU Usage', 'unite': '%'},
+            'cpu_status': {'nom': 'CPU Status', 'unite': 'status'},
+            'ram_used': {'nom': 'RAM Used', 'unite': 'bytes'},
+            'ram_total': {'nom': 'RAM Total', 'unite': 'bytes'},
+            'ram_status': {'nom': 'RAM Status', 'unite': 'status'},
+            'storage_used': {'nom': 'Storage Used', 'unite': 'bytes'},
+            'storage_total': {'nom': 'Storage Total', 'unite': 'bytes'},
+            'uptime_ms': {'nom': 'Uptime', 'unite': 'ms'}
         }
         sensor_type_ids = {}
         for key, info in sensor_types.items():
@@ -69,10 +84,8 @@ def register_microcontroller():
         db.session.commit()
 
         # Trigger notification
-        db.session.execute("NOTIFY new_microcontrolleur, %s", (json.dumps({
-            'id': microcontroller.id,
-            'nom': microcontroller.nom
-        }),))
+        payload = json.dumps({'id': microcontroller.id, 'nom': microcontroller.nom})
+        db.session.execute(text("NOTIFY new_microcontrolleur, :payload"), {"payload": payload})
 
         return jsonify({
             'message': 'Microcontroller registered',
